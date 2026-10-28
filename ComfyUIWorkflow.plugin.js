@@ -1,22 +1,28 @@
 /**
  * @name ComfyUIWorkflow
  * @author mr-asa
- * @description Marks images and videos in chat that contain an embedded ComfyUI workflow or prompt (PNG, WebP, JPEG, MP4, WebM, MOV, MKV, FLAC, MP3, OGG, OPUS, M4A, WAV). Click the badge for actions.
- * @version 0.5.0
+ * @description Marks images, videos, audio and .json files in chat that contain an embedded ComfyUI workflow or prompt. Click the badge to view the prompts, save the JSON, send it to a running ComfyUI, or see the models and LoRAs it uses.
+ * @version 0.9.0
  */
 
 const fs = require("fs");
 const path = require("path");
 
 const DEFAULT_FOLDER = path.join((process.env.USERPROFILE || process.env.HOME || "."), "Documents", "ComfyUI workflows");
+const DEFAULT_SERVER = "http://127.0.0.1:8188";
 const BADGE_CLASS = "cuw-badge";
 const MARKED_ATTR = "data-cuw-checked";
 const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const KEYS = ["workflow", "prompt"];
 const IMAGE_EXT = /\.(png|webp|jpe?g)$/i;
-const RANGE_EXT = /\.(mp4|webm|mov|mkv|m4v|flac|mp3|ogg|opus|m4a|wav)$/i; // read head+tail only
-const RANGE_CHUNK = 4 * 1024 * 1024; // bytes read from the head and tail of videos
+const BOX_EXT = /\.(mp4|mov|m4v|m4a)$/i; // ISO base media: walk the boxes to find moov
+const RANGE_EXT = /\.(mp4|webm|mov|mkv|m4v|flac|mp3|ogg|opus|m4a|wav)$/i; // large: never download whole
+const JSON_EXT = /\.json$/i;
+const RANGE_CHUNK = 4 * 1024 * 1024; // bytes read from the head and tail of large files
+const MAX_MOOV = 64 * 1024 * 1024;
 const MAX_JSON = 32 * 1024 * 1024;
+const MAX_JSON_FILE = 16 * 1024 * 1024;
+const MODEL_EXT = /\.(safetensors|ckpt|pt|pth|bin|gguf|sft|onnx)$/i;
 
 const css = `
 .${BADGE_CLASS} {
@@ -27,18 +33,265 @@ const css = `
     cursor: pointer; user-select: none;
 }
 .${BADGE_CLASS}:hover { background: rgba(40, 40, 40, 0.95); }
+.${BADGE_CLASS}.cuw-code { left: auto; right: 6px; }
+.cuw-card { display: flex; flex-direction: column; gap: 14px; color: var(--text-normal); user-select: text; }
+.cuw-card h4 { margin: 0 0 4px; font-size: 12px; text-transform: uppercase; color: var(--header-secondary); }
+.cuw-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 14px; }
+.cuw-row .cuw-name { flex: 1; word-break: break-all; }
+.cuw-row .cuw-extra { color: var(--text-muted); font-size: 12px; }
+.cuw-ok { color: #4ade80; } .cuw-missing { color: #f87171; } .cuw-unknown { color: var(--text-muted); }
+.cuw-links a { margin-left: 8px; font-size: 12px; }
+.cuw-links img { width: 18px; height: 18px; vertical-align: middle; border-radius: 3px; }
+.cuw-note { color: var(--text-muted); font-size: 12px; }
 `;
+
+/* ------------------------------- graph helpers ------------------------------- */
+
+const isLink = v => Array.isArray(v) && v.length === 2 && (typeof v[0] === "string" || typeof v[0] === "number") && typeof v[1] === "number";
+
+/** API prompt graph ({id: {class_type, inputs}}) built from an editor workflow, links resolved. */
+function graphFromWorkflow(wf) {
+    const links = new Map();
+    for (const l of wf.links || []) {
+        if (Array.isArray(l)) links.set(l[0], [l[1], l[2]]);
+        else if (l && l.id != null) links.set(l.id, [l.origin_id, l.origin_slot]);
+    }
+    const g = {};
+    for (const n of wf.nodes || []) {
+        const inputs = {};
+        for (const i of n.inputs || []) {
+            if (i.link == null) continue;
+            const l = links.get(i.link);
+            if (l) inputs[i.name] = [String(l[0]), l[1]];
+        }
+        if (/TextEncode|String|Text|Prompt/i.test(n.type) && inputs.text === undefined) {
+            const w = (n.widgets_values || []).find(x => typeof x === "string");
+            if (w !== undefined) inputs.text = w;
+        }
+        g[String(n.id)] = { class_type: n.type, inputs, widgets: n.widgets_values };
+    }
+    return g;
+}
+
+function variantGraph(variant) {
+    try {
+        if (variant.prompt) return JSON.parse(variant.prompt);
+        if (variant.workflow) return graphFromWorkflow(JSON.parse(variant.workflow));
+    } catch { /* fall through */ }
+    return null;
+}
+
+/** Follow a conditioning/text link back to the text it ultimately carries. */
+function traceText(g, ref, seen = new Set()) {
+    const id = String(ref[0]);
+    const node = g[id];
+    if (!node || seen.has(id)) return "";
+    seen.add(id);
+    const inp = node.inputs || {};
+    const texts = [];
+    for (const k of ["text", "text_g", "text_l", "prompt", "string", "value", "positive_prompt"]) {
+        if (typeof inp[k] === "string" && inp[k].trim() && !texts.includes(inp[k])) texts.push(inp[k]);
+    }
+    if (texts.length) return texts.join("\n");
+    const preferred = ["text", "string", "value", "conditioning", "conditioning_1", "conditioning_to", "positive", "prompt"];
+    const keys = [...preferred.filter(k => k in inp), ...Object.keys(inp).filter(k => !preferred.includes(k))];
+    for (const k of keys) {
+        if (!isLink(inp[k])) continue;
+        const r = traceText(g, inp[k], seen);
+        if (r) return r;
+    }
+    return "";
+}
+
+/** {positive, negative} prompt texts, traced from the sampler; falls back to the first two text encoders. */
+function extractPrompts(variant) {
+    const g = variantGraph(variant);
+    if (!g) return {};
+    const entries = Object.entries(g).sort((a, b) => Number(a[0]) - Number(b[0]));
+    const sampler = entries.find(([, n]) => /sampler/i.test(n.class_type) && isLink(n.inputs?.positive));
+    if (sampler) {
+        const inp = sampler[1].inputs;
+        return {
+            positive: traceText(g, inp.positive) || undefined,
+            negative: isLink(inp.negative) ? traceText(g, inp.negative) || undefined : undefined
+        };
+    }
+    const enc = entries.filter(([, n]) => /CLIPTextEncode/i.test(n.class_type) && typeof n.inputs?.text === "string");
+    return { positive: enc[0]?.[1].inputs.text, negative: enc[1]?.[1].inputs.text };
+}
+
+function modelKind(key, cls) {
+    const s = `${key ?? ""} ${cls ?? ""}`.toLowerCase();
+    if (/lora/.test(s)) return "LoRA";
+    if (/ckpt|checkpoint/.test(s)) return "Checkpoint";
+    if (/vae/.test(s)) return "VAE";
+    if (/controlnet|control_net/.test(s)) return "ControlNet";
+    if (/unet|diffusion|gguf/.test(s)) return "Diffusion model";
+    if (/clip|t5|text_encoder|llm/.test(s)) return "Text encoder";
+    if (/upscale/.test(s)) return "Upscaler";
+    if (/ipadapter|ip_adapter/.test(s)) return "IP-Adapter";
+    if (/embedding|textual/.test(s)) return "Embedding";
+    return "Model";
+}
+
+/** Model files (checkpoints, LoRAs, VAEs, ...) used by a variant. */
+function extractModels(variant) {
+    const out = [];
+    const seen = new Set();
+    const add = (name, key, cls, strength) => {
+        const k = `${name}|${cls}`;
+        if (seen.has(k)) return;
+        seen.add(k);
+        out.push({ name, kind: modelKind(key, cls), cls, key, strength });
+    };
+    try {
+        if (variant.prompt) {
+            for (const node of Object.values(JSON.parse(variant.prompt))) {
+                const inp = node?.inputs;
+                if (!inp) continue;
+                const strength = inp.strength_model ?? inp.strength;
+                for (const [key, v] of Object.entries(inp)) {
+                    if (typeof v === "string" && MODEL_EXT.test(v)) add(v, key, node.class_type, typeof strength === "number" ? strength : undefined);
+                    else if (v && typeof v === "object" && !Array.isArray(v)) {
+                        // e.g. rgthree Power Lora Loader: {on, lora, strength}
+                        const s = Object.values(v).find(x => typeof x === "string" && MODEL_EXT.test(x));
+                        if (s) add(s, key, node.class_type, typeof v.strength === "number" ? v.strength : undefined);
+                    }
+                }
+            }
+        } else if (variant.workflow) {
+            for (const node of JSON.parse(variant.workflow).nodes || []) {
+                for (const w of node.widgets_values || []) {
+                    if (typeof w === "string" && MODEL_EXT.test(w)) add(w, undefined, node.type);
+                    else if (w && typeof w === "object" && !Array.isArray(w)) {
+                        const s = Object.values(w).find(x => typeof x === "string" && MODEL_EXT.test(x));
+                        if (s) add(s, undefined, node.type, typeof w.strength === "number" ? w.strength : undefined);
+                    }
+                }
+            }
+        }
+    } catch { /* ignore malformed graphs */ }
+    return out;
+}
+
+const normName = s => String(s).trim().replace(/\\/g, "/").toLowerCase();
+const noExt = s => normName(s).split("/").pop().replace(MODEL_EXT, "");
+const searchLinks = name => [
+    ["Civitai", `https://civitai.com/search/models?query=${encodeURIComponent(noExt(name))}`, "civitai.com"],
+    ["Hugging Face", `https://huggingface.co/models?search=${encodeURIComponent(noExt(name))}`, "huggingface.co"],
+    ["Web", `https://www.google.com/search?q=${encodeURIComponent(noExt(name))}`, "www.google.com"]
+];
+
+/* ------------------------------- byte helpers ------------------------------- */
+
+async function inflate(bytes) {
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+const utf8 = new TextDecoder("utf-8");
+const latin = new TextDecoder("latin1");
+
+/**
+ * Find workflow/prompt JSON objects inside arbitrary text. Workflow JSON has "nodes";
+ * API prompt JSON has "class_type". Returns variants paired by order of appearance.
+ */
+function scanText(text) {
+    const starts = /\{\s*"(?:last_node_id|id|revision|version|nodes|\d+)"\s*:/g;
+    const workflows = [];
+    const prompts = [];
+    let m;
+    while ((m = starts.exec(text))) {
+        const end = matchBrace(text, m.index);
+        if (end < 0) continue;
+        starts.lastIndex = end + 1;
+        const chunk = text.slice(m.index, end + 1);
+        let obj;
+        try { obj = JSON.parse(chunk); } catch { continue; }
+        if (Array.isArray(obj.nodes)) { if (!workflows.includes(chunk)) workflows.push(chunk); }
+        else if (Object.values(obj).some(v => v && typeof v === "object" && "class_type" in v)) { if (!prompts.includes(chunk)) prompts.push(chunk); }
+    }
+    return pairVariants(workflows, prompts);
+}
+
+function pairVariants(workflows, prompts) {
+    const variants = [];
+    for (let i = 0; i < Math.max(workflows.length, prompts.length); i++) {
+        variants.push({ workflow: workflows[i], prompt: prompts[i] });
+    }
+    return variants.length ? { variants } : null;
+}
+
+/** Index of the brace closing the object that opens at `start`, string-aware; -1 if none. */
+function matchBrace(text, start) {
+    let depth = 0, inStr = false;
+    const limit = Math.min(text.length, start + MAX_JSON);
+    for (let i = start; i < limit; i++) {
+        const c = text.charCodeAt(i);
+        if (inStr) {
+            if (c === 92) i++;
+            else if (c === 34) inStr = false;
+        } else if (c === 34) inStr = true;
+        else if (c === 123) depth++;
+        else if (c === 125 && --depth === 0) return i;
+    }
+    return -1;
+}
+
+const scanBytes = buf => scanText(utf8.decode(buf));
+
+async function parsePng(buf) {
+    if (!PNG_SIG.every((b, i) => buf[i] === b)) return null;
+    const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const found = {};
+    let pos = 8;
+
+    while (pos + 8 <= buf.length) {
+        const len = view.getUint32(pos);
+        const type = latin.decode(buf.subarray(pos + 4, pos + 8));
+        const start = pos + 8;
+        const end = start + len;
+        if (type === "IEND") break;
+        if (type === "tEXt" || type === "zTXt" || type === "iTXt") {
+            const chunk = buf.subarray(start, end);
+            const nul = chunk.indexOf(0);
+            const key = latin.decode(chunk.subarray(0, nul)).toLowerCase();
+            if (KEYS.includes(key)) {
+                try {
+                    if (type === "tEXt") {
+                        found[key] = utf8.decode(chunk.subarray(nul + 1));
+                    } else if (type === "zTXt") {
+                        found[key] = utf8.decode(await inflate(chunk.subarray(nul + 2)));
+                    } else {
+                        // iTXt: key\0 compFlag compMethod lang\0 translated\0 text
+                        let p = chunk.indexOf(0, nul + 3) + 1;
+                        p = chunk.indexOf(0, p) + 1;
+                        const body = chunk.subarray(p);
+                        found[key] = utf8.decode(chunk[nul + 1] === 1 ? await inflate(body) : body);
+                    }
+                } catch { /* unreadable chunk: skip */ }
+            }
+        }
+        pos = end + 4; // skip CRC
+    }
+    return found.workflow || found.prompt ? { variants: [{ workflow: found.workflow, prompt: found.prompt }] } : null;
+}
 
 module.exports = class ComfyUIWorkflow {
     constructor(meta) {
         this.meta = meta;
-        this.cache = new Map(); // url -> Promise<{workflow, prompt} | null>
+        this.cache = new Map(); // url -> Promise<{variants} | null>
         this.observer = null;
+        this.scanTimer = null;
+        this.iconCache = null;
     }
 
     start() {
         BdApi.DOM.addStyle(this.meta.name, css);
-        this.observer = new MutationObserver(() => this.scan());
+        this.observer = new MutationObserver(() => {
+            if (this.scanTimer) return;
+            this.scanTimer = setTimeout(() => { this.scanTimer = null; this.scan(); }, 150);
+        });
         this.observer.observe(document.body, { childList: true, subtree: true });
         this.scan();
     }
@@ -46,24 +299,26 @@ module.exports = class ComfyUIWorkflow {
     stop() {
         this.observer?.disconnect();
         this.observer = null;
+        clearTimeout(this.scanTimer);
+        this.scanTimer = null;
         BdApi.DOM.removeStyle(this.meta.name);
         document.querySelectorAll(`.${BADGE_CLASS}`).forEach(b => b.remove());
         document.querySelectorAll(`[${MARKED_ATTR}]`).forEach(e => e.removeAttribute(MARKED_ATTR));
         this.cache.clear();
     }
 
+    /* ----------------------------------- chat ----------------------------------- */
+
     scan() {
-        const media = document.querySelectorAll(
-            `[class*="messagesWrapper"] :is(img, video, audio)[src*="discordapp"]:not([${MARKED_ATTR}])`
-        );
-        media.forEach(el => this.process(el));
-        // Audio attachments are often just a file card with a link until played.
-        const links = document.querySelectorAll(
-            `[class*="messagesWrapper"] a[href*="discordapp"]:not([${MARKED_ATTR}])`
-        );
-        links.forEach(a => {
-            if (RANGE_EXT.test(a.pathname)) this.process(a);
+        const root = `[class*="messagesWrapper"]`;
+        document.querySelectorAll(`${root} :is(img, video, audio)[src*="discordapp"]:not([${MARKED_ATTR}])`)
+            .forEach(el => this.process(el));
+        // Audio and .json attachments are file cards with a link.
+        document.querySelectorAll(`${root} a[href*="discordapp"]:not([${MARKED_ATTR}])`).forEach(a => {
+            if (RANGE_EXT.test(a.pathname) || JSON_EXT.test(a.pathname)) this.process(a);
         });
+        // Workflow JSON pasted as a code block.
+        document.querySelectorAll(`${root} code:not([${MARKED_ATTR}])`).forEach(code => this.processCode(code));
     }
 
     async process(el) {
@@ -79,13 +334,28 @@ module.exports = class ComfyUIWorkflow {
         const host = el.matches("a")
             ? el.closest('[class*="attachment"], [class*="container"]') ?? el.parentElement
             : el.parentElement;
-        if (!host || host.querySelector(`.${BADGE_CLASS}`)) return;
+        this.addBadge(host, url, data);
+    }
+
+    processCode(code) {
+        code.setAttribute(MARKED_ATTR, "1");
+        const text = code.textContent;
+        if (text.length < 300 || !/class_type|"nodes"/.test(text)) return;
+        const data = scanText(text);
+        if (!data) return;
+        const host = code.closest("pre") ?? code;
+        this.addBadge(host, `pasted-${Date.now()}.json`, data, true);
+    }
+
+    addBadge(host, url, data, isCode = false) {
+        if (!host || host.querySelector(`:scope > .${BADGE_CLASS}`)) return;
         if (getComputedStyle(host).position === "static") host.style.position = "relative";
 
+        const hasWorkflow = data.variants.some(v => v.workflow);
         const badge = document.createElement("div");
-        badge.className = BADGE_CLASS;
-        badge.textContent = data.workflow ? "WF" : "P";
-        badge.title = data.workflow
+        badge.className = BADGE_CLASS + (isCode ? " cuw-code" : "");
+        badge.textContent = hasWorkflow ? "WF" : "P";
+        badge.title = hasWorkflow
             ? "ComfyUI workflow found. Click for actions."
             : "ComfyUI prompt (no full workflow) found. Click for actions.";
         const openMenu = e => {
@@ -98,8 +368,14 @@ module.exports = class ComfyUIWorkflow {
         host.appendChild(badge);
     }
 
+    /* -------------------------------- settings / UI ------------------------------- */
+
     get folder() {
         return BdApi.Data.load(this.meta.name, "folder") || DEFAULT_FOLDER;
+    }
+
+    get server() {
+        return (BdApi.Data.load(this.meta.name, "server") || DEFAULT_SERVER).trim().replace(/\/+$/, "");
     }
 
     async chooseFolder(onDone) {
@@ -117,38 +393,72 @@ module.exports = class ComfyUIWorkflow {
         }
     }
 
+    async readClipboard() {
+        try { return (await navigator.clipboard.readText()).trim(); } catch { return ""; }
+    }
+
+    async testServer(url) {
+        try {
+            const res = await BdApi.Net.fetch(`${url}/system_stats`);
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            BdApi.UI.showToast("ComfyUI is reachable", { type: "success" });
+            return true;
+        } catch (err) {
+            BdApi.UI.showToast(`Cannot reach ${url}: ${err.message}`, { type: "error" });
+            return false;
+        }
+    }
+
     getSettingsPanel() {
         const React = BdApi.React;
+        const h = React.createElement;
         const plugin = this;
+        const btn = (label, onClick) => h("button", {
+            onClick,
+            style: { padding: "8px 16px", borderRadius: 4, border: "none", cursor: "pointer", background: "var(--brand-500, #5865f2)", color: "#fff" }
+        }, label);
         const Panel = () => {
             const [folder, setFolder] = React.useState(plugin.folder);
-            return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8, color: "var(--header-primary)" } },
-                React.createElement("div", null, "Save folder: " + folder),
-                React.createElement("button", {
-                    onClick: () => plugin.chooseFolder(setFolder),
-                    style: { alignSelf: "flex-start", padding: "8px 16px", borderRadius: 4, border: "none", cursor: "pointer", background: "var(--brand-500, #5865f2)", color: "#fff" }
-                }, "Choose folder...")
+            const [server, setServer] = React.useState(plugin.server);
+            const update = v => { setServer(v); BdApi.Data.save(plugin.meta.name, "server", v.trim()); };
+            const inputRef = el => {
+                // Discord swallows key events in plugin settings; keep them on the input.
+                if (!el || el.cuwPatched) return;
+                el.cuwPatched = true;
+                ["keydown", "keyup", "keypress"].forEach(ev => el.addEventListener(ev, e => e.stopImmediatePropagation()));
+            };
+            return h("div", { style: { display: "flex", flexDirection: "column", gap: 12, color: "var(--header-primary)" } },
+                h("div", null, "Save folder: " + folder),
+                h("div", null, btn("Choose folder...", () => plugin.chooseFolder(setFolder))),
+                h("div", { style: { marginTop: 8 } }, "ComfyUI server URL (used by \"Send to ComfyUI\" and the model check):"),
+                h("input", {
+                    ref: inputRef, type: "text", value: server, spellCheck: false,
+                    onChange: e => update(e.target.value),
+                    style: { padding: 8, borderRadius: 4, border: "none", userSelect: "text", background: "var(--input-background, #1e1f22)", color: "var(--text-normal, #fff)" }
+                }),
+                h("div", { style: { display: "flex", gap: 8 } },
+                    btn("Paste from clipboard", async () => { const t = await plugin.readClipboard(); if (t) update(t); }),
+                    btn("Test connection", () => plugin.testServer(server.trim().replace(/\/+$/, "")))
+                )
             );
         };
-        return React.createElement(Panel);
+        return h(Panel);
     }
 
     showMenu(event, url, data) {
-        const base = decodeURIComponent(new URL(url).pathname.split("/").pop()).replace(/\.[a-z0-9]+$/i, "");
+        const base = decodeURIComponent(new URL(url, "https://x.invalid/").pathname.split("/").pop()).replace(/\.[a-z0-9]+$/i, "");
+        const multi = data.variants.length > 1;
         const items = [];
-        for (const [key, suffix] of [["workflow", ""], ["prompt", ".prompt"]]) {
-            if (!data[key]) continue;
-            items.push(
-                {
-                    label: `Copy ${key}`,
-                    action: () => {
-                        DiscordNative.clipboard.copy(data[key]);
-                        BdApi.UI.showToast(`${key[0].toUpperCase() + key.slice(1)} copied`, { type: "success" });
-                    }
-                },
-                { label: `Save ${key} as JSON`, action: () => this.save(base + suffix, data[key]) }
-            );
-        }
+        data.variants.forEach((variant, i) => {
+            const tag = multi ? ` #${i + 1}` : "";
+            const file = multi ? `${base}_${i + 1}` : base;
+            const { positive, negative } = extractPrompts(variant);
+            if (positive || negative) items.push({ label: `Prompts${tag}`, action: () => this.showPrompts({ positive, negative }, file) });
+            if (variant.prompt) items.push({ label: `Send to ComfyUI${tag}`, action: () => this.sendToComfy(variant.prompt) });
+            if (extractModels(variant).length) items.push({ label: `Models and LoRAs${tag}`, action: () => this.showModels(variant, file) });
+            if (variant.workflow) items.push({ label: `Save workflow as JSON${tag}`, action: () => this.save(file, variant.workflow) });
+            if (variant.prompt) items.push({ label: `Save prompt as JSON${tag}`, action: () => this.save(file + ".prompt", variant.prompt) });
+        });
         items.push(
             { label: "Change save folder...", action: () => this.chooseFolder() },
             {
@@ -160,6 +470,29 @@ module.exports = class ComfyUIWorkflow {
             }
         );
         BdApi.ContextMenu.open(event, BdApi.ContextMenu.buildMenu(items));
+    }
+
+    showPrompts({ positive, negative }, title) {
+        const React = BdApi.React;
+        const h = React.createElement;
+        const section = (label, text) => text && h("div", { key: label },
+            h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 } },
+                h("h4", { style: { margin: 0 } }, label),
+                h("button", {
+                    onClick: () => {
+                        DiscordNative.clipboard.copy(text);
+                        BdApi.UI.showToast(`${label} prompt copied`, { type: "success" });
+                    },
+                    style: { padding: "4px 12px", borderRadius: 4, border: "none", cursor: "pointer", background: "var(--brand-500, #5865f2)", color: "#fff" }
+                }, "Copy")
+            ),
+            h("textarea", {
+                readOnly: true, value: text, rows: Math.min(10, Math.max(3, Math.ceil(text.length / 70))),
+                style: { width: "100%", boxSizing: "border-box", padding: 8, borderRadius: 4, border: "none", resize: "vertical", userSelect: "text", background: "var(--input-background, #1e1f22)", color: "var(--text-normal, #fff)" }
+            })
+        );
+        const content = h("div", { className: "cuw-card" }, section("Positive", positive), section("Negative", negative));
+        BdApi.UI.showConfirmationModal(`Prompts: ${title}`, content, { confirmText: "Close", cancelText: null });
     }
 
     save(base, json) {
@@ -176,13 +509,120 @@ module.exports = class ComfyUIWorkflow {
         }
     }
 
+    /* ----------------------------------- ComfyUI ----------------------------------- */
+
+    async sendToComfy(promptJson) {
+        const server = this.server;
+        try {
+            const res = await BdApi.Net.fetch(`${server}/prompt`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ prompt: JSON.parse(promptJson), client_id: "discord-comfyui-workflow" })
+            });
+            const text = await res.text();
+            if (res.ok) {
+                let n = "";
+                try { n = ` (queue #${JSON.parse(text).number})`; } catch { /* no number */ }
+                BdApi.UI.showToast("Queued in ComfyUI" + n, { type: "success" });
+                return;
+            }
+            let msg = `HTTP ${res.status}`;
+            try {
+                const err = JSON.parse(text);
+                msg = err.error?.message || msg;
+                const bad = Object.values(err.node_errors || {}).map(n => n.class_type).filter(Boolean);
+                if (bad.length) msg += `: ${[...new Set(bad)].join(", ")}`;
+            } catch { /* keep HTTP status */ }
+            BdApi.UI.showToast("ComfyUI rejected the prompt: " + msg, { type: "error", timeout: 8000 });
+        } catch (err) {
+            BdApi.UI.showToast(`Cannot reach ComfyUI at ${server} (${err.message}). Set the URL in plugin settings.`, { type: "error", timeout: 8000 });
+        }
+    }
+
+    /** Option lists of every combo input of a node class on the server, or null if unreachable. */
+    async comboOptions(cls) {
+        try {
+            const res = await BdApi.Net.fetch(`${this.server}/object_info/${encodeURIComponent(cls)}`);
+            if (!res.ok) return null;
+            const info = (await res.json())[cls];
+            if (!info) return null;
+            const out = {};
+            for (const group of [info.input?.required, info.input?.optional]) {
+                for (const [key, spec] of Object.entries(group || {})) {
+                    const opts = Array.isArray(spec?.[0]) ? spec[0] : spec?.[1]?.options;
+                    if (Array.isArray(opts)) out[key] = opts;
+                }
+            }
+            return out;
+        } catch {
+            return null;
+        }
+    }
+
+    /** Site favicons as data URIs (fetched outside the page, so Discord's CSP does not apply). */
+    async loadIcons() {
+        this.iconCache ??= new Map();
+        await Promise.all(searchLinks("x").map(async ([, , domain]) => {
+            if (this.iconCache.has(domain)) return;
+            try {
+                const res = await BdApi.Net.fetch(`https://${domain}/favicon.ico`);
+                if (!res.ok) return;
+                const bytes = new Uint8Array(await res.arrayBuffer());
+                let bin = "";
+                for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+                this.iconCache.set(domain, `data:${res.headers?.get?.("content-type") || "image/x-icon"};base64,${btoa(bin)}`);
+            } catch { /* fall back to the text label */ }
+        }));
+        return this.iconCache;
+    }
+
+    async showModels(variant, title) {
+        const models = extractModels(variant);
+        const classes = [...new Set(models.map(m => m.cls))];
+        const options = new Map();
+        await Promise.all(classes.map(async c => options.set(c, await this.comboOptions(c))));
+        const status = m => {
+            const combos = options.get(m.cls);
+            if (!combos) return "unknown";
+            const lists = m.key && combos[m.key] ? [combos[m.key]] : Object.values(combos);
+            const want = normName(m.name);
+            return lists.some(l => l.some(o => normName(o) === want)) ? "ok" : "missing";
+        };
+        const reachable = [...options.values()].some(Boolean);
+        const icons = await this.loadIcons();
+
+        const React = BdApi.React;
+        const h = React.createElement;
+        const kinds = [...new Set(models.map(m => m.kind))];
+        const content = h("div", { className: "cuw-card" },
+            !reachable && h("div", { className: "cuw-note" }, `ComfyUI at ${this.server} is not reachable, so availability is unknown.`),
+            kinds.map(kind => h("div", { key: kind },
+                h("h4", null, kind),
+                models.filter(m => m.kind === kind).map(m => {
+                    const st = status(m);
+                    return h("div", { className: "cuw-row", key: m.name + m.cls },
+                        h("span", { className: `cuw-${st}`, title: st }, st === "ok" ? "✓" : st === "missing" ? "✗" : "?"),
+                        h("span", { className: "cuw-name" }, m.name),
+                        m.strength !== undefined && h("span", { className: "cuw-extra" }, `strength ${m.strength}`),
+                        h("span", { className: "cuw-links" },
+                            searchLinks(m.name).map(([label, href, domain]) => h("a", { key: label, href, title: `Search ${label}`, target: "_blank", rel: "noreferrer" },
+                                icons.get(domain) ? h("img", { src: icons.get(domain), alt: label }) : label)))
+                    );
+                })
+            ))
+        );
+        BdApi.UI.showConfirmationModal(`Models and LoRAs: ${title}`, content, { confirmText: "Close", cancelText: null });
+    }
+
+    /* ------------------------------------ fetching ----------------------------------- */
+
     /** Strip Discord resize params so we get the original file with its metadata. */
     originalUrl(src) {
         try {
             const u = new URL(src);
             if (u.hostname === "media.discordapp.net") u.hostname = "cdn.discordapp.com";
             ["width", "height", "format", "quality", "animated"].forEach(p => u.searchParams.delete(p));
-            if (!IMAGE_EXT.test(u.pathname) && !RANGE_EXT.test(u.pathname)) return null;
+            if (![IMAGE_EXT, RANGE_EXT, JSON_EXT].some(re => re.test(u.pathname))) return null;
             return u.toString();
         } catch {
             return null;
@@ -195,119 +635,83 @@ module.exports = class ComfyUIWorkflow {
     }
 
     async fetchMeta(url) {
-        if (RANGE_EXT.test(new URL(url).pathname)) return this.fetchRangeMeta(url);
+        const name = new URL(url).pathname;
+        if (RANGE_EXT.test(name)) return this.fetchLargeMeta(url, BOX_EXT.test(name));
         const res = await BdApi.Net.fetch(url);
         if (!res.ok) return null;
         const buf = new Uint8Array(await res.arrayBuffer());
-        return this.parsePng(buf) ?? this.scanJson(buf);
+        if (JSON_EXT.test(name)) return buf.length > MAX_JSON_FILE ? null : scanBytes(buf);
+        return (await parsePng(buf)) ?? scanBytes(buf);
     }
 
-    /** Videos and audio can be huge: read only the head and the tail (metadata sits in moov/Tags at either end). */
-    async fetchRangeMeta(url) {
-        const [head, tail] = await Promise.all([
-            this.fetchRange(url, `bytes=0-${RANGE_CHUNK - 1}`, true),
-            this.fetchRange(url, `bytes=-${RANGE_CHUNK}`, false)
-        ]);
-        const found = {};
-        for (const buf of [head, tail]) if (buf) Object.assign(found, this.scanJson(buf) ?? {});
-        return found.workflow || found.prompt ? found : null;
+    /** Video/audio can be huge: read only the parts that hold metadata. */
+    async fetchLargeMeta(url, isBox) {
+        const workflows = [];
+        const prompts = [];
+        const collect = buf => {
+            const r = buf && scanBytes(buf);
+            for (const v of r?.variants ?? []) {
+                if (v.workflow && !workflows.includes(v.workflow)) workflows.push(v.workflow);
+                if (v.prompt && !prompts.includes(v.prompt)) prompts.push(v.prompt);
+            }
+        };
+        if (isBox) collect(await this.readMoov(url));
+        if (!workflows.length && !prompts.length) {
+            const [head, tail] = await Promise.all([
+                this.fetchRange(url, `bytes=0-${RANGE_CHUNK - 1}`, RANGE_CHUNK, true),
+                this.fetchRange(url, `bytes=-${RANGE_CHUNK}`, RANGE_CHUNK, false)
+            ]);
+            collect(head);
+            collect(tail);
+        }
+        return pairVariants(workflows, prompts);
     }
 
-    async fetchRange(url, range, isHead) {
+    /** Walk the top-level ISO boxes with small Range requests and read the moov box. */
+    async readMoov(url) {
+        let off = 0;
+        for (let guard = 0; guard < 64; guard++) {
+            const hdr = await this.fetchRange(url, `bytes=${off}-${off + 15}`, 16, off === 0);
+            if (!hdr || hdr.length < 8) return null;
+            const view = new DataView(hdr.buffer, hdr.byteOffset, hdr.byteLength);
+            let size = view.getUint32(0);
+            const type = latin.decode(hdr.subarray(4, 8));
+            if (size === 1 && hdr.length >= 16) size = Number(view.getBigUint64(8));
+            if (size < 8) return null; // size 0 = "to end of file": nothing more to walk
+            if (type === "moov") {
+                return size <= MAX_MOOV ? this.fetchRange(url, `bytes=${off}-${off + size - 1}`, size, false) : null;
+            }
+            off += size;
+        }
+        return null;
+    }
+
+    /**
+     * Fetch a byte range. When the server ignores Range (status 200) only the head of the file is
+     * usable, and only when `allowFull` is set; the stream is cancelled after `maxBytes`.
+     */
+    async fetchRange(url, range, maxBytes, allowFull) {
         const res = await BdApi.Net.fetch(url, { headers: { Range: range } });
         if (!res.ok) return null;
-        // Server ignored Range (200): only the head is usable; do not read the whole file for the tail.
-        if (res.status !== 206 && !isHead) return null;
+        if (res.status !== 206 && !allowFull) return null;
         const reader = res.body.getReader();
         const parts = [];
         let size = 0;
-        while (size < RANGE_CHUNK) {
+        while (size < maxBytes) {
             const { done, value } = await reader.read();
             if (done) break;
             parts.push(value);
             size += value.length;
         }
         reader.cancel().catch(() => {});
-        const out = new Uint8Array(size);
-        let off = 0;
-        for (const p of parts) { out.set(p, off); off += p.length; }
+        const out = new Uint8Array(Math.min(size, maxBytes));
+        let at = 0;
+        for (const p of parts) {
+            const piece = p.subarray(0, out.length - at);
+            out.set(piece, at);
+            at += piece.length;
+            if (at >= out.length) break;
+        }
         return out;
-    }
-
-    /**
-     * Format-agnostic fallback (WebP/JPEG EXIF, MP4/WebM tags): find JSON objects in the raw bytes
-     * and classify them. Workflow JSON has "nodes"; API prompt JSON has "class_type".
-     */
-    scanJson(buf) {
-        const text = new TextDecoder("utf-8").decode(buf);
-        const starts = /\{\s*"(?:last_node_id|id|revision|version|nodes|\d+)"\s*:/g;
-        const found = {};
-        let m;
-        while ((m = starts.exec(text))) {
-            const end = this.matchBrace(text, m.index);
-            if (end < 0) continue;
-            const chunk = text.slice(m.index, end + 1);
-            let obj;
-            try { obj = JSON.parse(chunk); } catch { continue; }
-            if (Array.isArray(obj.nodes) && !found.workflow) found.workflow = chunk;
-            else if (!found.prompt && Object.values(obj).some(v => v && typeof v === "object" && "class_type" in v)) found.prompt = chunk;
-            starts.lastIndex = end + 1;
-            if (found.workflow && found.prompt) break;
-        }
-        return found.workflow || found.prompt ? found : null;
-    }
-
-    /** Index of the brace closing the object that opens at `start`, string-aware; -1 if none. */
-    matchBrace(text, start) {
-        let depth = 0, inStr = false;
-        const limit = Math.min(text.length, start + MAX_JSON);
-        for (let i = start; i < limit; i++) {
-            const c = text.charCodeAt(i);
-            if (inStr) {
-                if (c === 92) i++;
-                else if (c === 34) inStr = false;
-            } else if (c === 34) inStr = true;
-            else if (c === 123) depth++;
-            else if (c === 125 && --depth === 0) return i;
-        }
-        return -1;
-    }
-
-    parsePng(buf) {
-        if (!PNG_SIG.every((b, i) => buf[i] === b)) return null;
-        const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-        const dec = new TextDecoder("utf-8");
-        const latin = new TextDecoder("latin1");
-        const found = {};
-        let pos = 8;
-
-        while (pos + 8 <= buf.length) {
-            const len = view.getUint32(pos);
-            const type = latin.decode(buf.subarray(pos + 4, pos + 8));
-            const start = pos + 8;
-            const end = start + len;
-            if (type === "tEXt" || type === "iTXt") {
-                const chunk = buf.subarray(start, end);
-                const nul = chunk.indexOf(0);
-                const key = latin.decode(chunk.subarray(0, nul));
-                if (KEYS.includes(key)) {
-                    let text;
-                    if (type === "tEXt") {
-                        text = dec.decode(chunk.subarray(nul + 1));
-                    } else {
-                        // iTXt: key\0 compFlag compMethod lang\0 translated\0 text
-                        if (chunk[nul + 1] === 1) { pos = end + 4; continue; } // compressed: skip
-                        let p = nul + 3;
-                        p = chunk.indexOf(0, p) + 1;
-                        p = chunk.indexOf(0, p) + 1;
-                        text = dec.decode(chunk.subarray(p));
-                    }
-                    found[key] = text;
-                }
-            }
-            if (type === "IDAT" || type === "IEND") break; // text chunks come before image data in ComfyUI output
-            pos = end + 4; // skip CRC
-        }
-        return found.workflow || found.prompt ? found : null;
     }
 };
