@@ -2,13 +2,15 @@
 
 A [BetterDiscord](https://betterdiscord.app) plugin that marks images, videos, audio and `.json` files in chat that contain an embedded [ComfyUI](https://github.com/comfyanonymous/ComfyUI) workflow or prompt.
 
+![The badge menu, the Prompts window and the Models and LoRAs card](_meta/windows_examples.png)
+
 ## Features
 
 - A **WF** badge appears on media with an embedded workflow, or **P** if only the API prompt is present.
 - Click (or right-click) the badge for:
   - **Prompts**: a window with the positive and negative prompt text (traced from the sampler), each with a Copy button
-  - **Send to ComfyUI**: queues the prompt on your running ComfyUI server
-  - **Models and LoRAs**: a card listing checkpoints, LoRAs, VAEs, etc. used, with a check against your server and a search link per entry (Civitai, Hugging Face, web search by file name), shown as site icons
+  - **Queue in ComfyUI**: queues the prompt on your running server, adjusting model paths to what the server has
+  - **Models and LoRAs**: a card listing checkpoints, LoRAs, VAEs, etc. used, with a check against your server (exact match, same file name in another folder, or the same model in another quantization) and a search link per entry (Civitai, Hugging Face, web search by file name), shown as site icons
   - **Save workflow / prompt as JSON** into a folder of your choice
 - Files with several workflows (e.g. a generation graph plus post-processing) get one set of menu items per workflow.
 - Supported sources: PNG, WebP, JPEG, MP4, WebM, MOV, MKV, FLAC, MP3, OGG, OPUS, M4A, WAV, `.json` attachments, and workflow JSON pasted as a code block.
@@ -21,6 +23,7 @@ A [BetterDiscord](https://betterdiscord.app) plugin that marks images, videos, a
 ## Settings
 
 - **Choose folder...**: where workflow JSON files are saved (default: `Documents\ComfyUI workflows`).
+- **Copy the file path to the clipboard after saving**: off by default.
 - **ComfyUI server URL**: default `http://127.0.0.1:8188`. Use **Test connection** to verify.
 
 ## Notes
@@ -32,3 +35,7 @@ A [BetterDiscord](https://betterdiscord.app) plugin that marks images, videos, a
 ## Credits
 
 Ideas for compressed PNG chunks, multi-workflow files, MP4 box reading, `.json` attachments, and the model/LoRA check come from [Discord-ComfyPeeper](https://github.com/ethanfel/Discord-ComfyPeeper) by ethanfel (GPL-3.0), a Vencord plugin with the same goal. No code was copied.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

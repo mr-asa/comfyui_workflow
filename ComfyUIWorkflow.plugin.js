@@ -1,8 +1,11 @@
 /**
  * @name ComfyUIWorkflow
  * @author mr-asa
- * @description Marks images, videos, audio and .json files in chat that contain an embedded ComfyUI workflow or prompt. Click the badge to view the prompts, save the JSON, send it to a running ComfyUI, or see the models and LoRAs it uses.
- * @version 0.9.0
+ * @description Marks images, videos, audio and .json files in chat that contain an embedded ComfyUI workflow or prompt. Click the badge to view the prompts, save the JSON, queue it in a running ComfyUI, or see the models and LoRAs it uses.
+ * @version 0.18.0
+ * @authorLink https://github.com/mr-asa
+ * @website https://github.com/mr-asa/comfyui_workflow
+ * @source https://raw.githubusercontent.com/mr-asa/comfyui_workflow/main/ComfyUIWorkflow.plugin.js
  */
 
 const fs = require("fs");
@@ -39,13 +42,33 @@ const css = `
 .cuw-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 14px; }
 .cuw-row .cuw-name { flex: 1; word-break: break-all; }
 .cuw-row .cuw-extra { color: var(--text-muted); font-size: 12px; }
-.cuw-ok { color: #4ade80; } .cuw-missing { color: #f87171; } .cuw-unknown { color: var(--text-muted); }
+.cuw-ok { color: #4ade80; } .cuw-similar { color: #fbbf24; } .cuw-related { color: var(--text-muted); } .cuw-missing { color: #f87171; } .cuw-unknown { color: var(--text-muted); }
 .cuw-links a { margin-left: 8px; font-size: 12px; }
 .cuw-links img { width: 18px; height: 18px; vertical-align: middle; border-radius: 3px; }
 .cuw-note { color: var(--text-muted); font-size: 12px; }
+/* Themes may make modals translucent: force an opaque surface for our windows. */
+[role="dialog"]:has(.cuw-card),
+[role="dialog"]:has(.cuw-card) :is([class*="root"], [class*="header"], [class*="content"], [class*="scroller"], [class*="footer"]):not(button, button *) {
+    background: #2b2d31 !important; backdrop-filter: none !important; opacity: 1 !important;
+}
+.theme-light [role="dialog"]:has(.cuw-card),
+.theme-light [role="dialog"]:has(.cuw-card) :is([class*="root"], [class*="header"], [class*="content"], [class*="scroller"], [class*="footer"]):not(button, button *) {
+    background: #ffffff !important;
+}
 `;
 
 /* ------------------------------- graph helpers ------------------------------- */
+
+/** JSON.parse that also accepts the NaN/Infinity values Python-written ComfyUI JSON can contain (read as null). */
+function parseJson(text) {
+    try {
+        return JSON.parse(text);
+    } catch (err) {
+        const fixed = text.replace(/"(?:[^"\\]|\\.)*"|-?Infinity|NaN/g, m => (m[0] === '"' ? m : "null"));
+        if (fixed === text) throw err;
+        return JSON.parse(fixed);
+    }
+}
 
 const isLink = v => Array.isArray(v) && v.length === 2 && (typeof v[0] === "string" || typeof v[0] === "number") && typeof v[1] === "number";
 
@@ -75,8 +98,8 @@ function graphFromWorkflow(wf) {
 
 function variantGraph(variant) {
     try {
-        if (variant.prompt) return JSON.parse(variant.prompt);
-        if (variant.workflow) return graphFromWorkflow(JSON.parse(variant.workflow));
+        if (variant.prompt) return parseJson(variant.prompt);
+        if (variant.workflow) return graphFromWorkflow(parseJson(variant.workflow));
     } catch { /* fall through */ }
     return null;
 }
@@ -108,11 +131,12 @@ function extractPrompts(variant) {
     const g = variantGraph(variant);
     if (!g) return {};
     const entries = Object.entries(g).sort((a, b) => Number(a[0]) - Number(b[0]));
-    const sampler = entries.find(([, n]) => /sampler/i.test(n.class_type) && isLink(n.inputs?.positive));
+    const sampler = entries.find(([, n]) => /sampler|guider/i.test(n.class_type) && isLink(n.inputs?.positive))
+        ?? entries.find(([, n]) => /guider/i.test(n.class_type) && isLink(n.inputs?.conditioning)); // BasicGuider: positive only
     if (sampler) {
         const inp = sampler[1].inputs;
         return {
-            positive: traceText(g, inp.positive) || undefined,
+            positive: traceText(g, inp.positive ?? inp.conditioning) || undefined,
             negative: isLink(inp.negative) ? traceText(g, inp.negative) || undefined : undefined
         };
     }
@@ -146,7 +170,7 @@ function extractModels(variant) {
     };
     try {
         if (variant.prompt) {
-            for (const node of Object.values(JSON.parse(variant.prompt))) {
+            for (const node of Object.values(parseJson(variant.prompt))) {
                 const inp = node?.inputs;
                 if (!inp) continue;
                 const strength = inp.strength_model ?? inp.strength;
@@ -160,7 +184,7 @@ function extractModels(variant) {
                 }
             }
         } else if (variant.workflow) {
-            for (const node of JSON.parse(variant.workflow).nodes || []) {
+            for (const node of parseJson(variant.workflow).nodes || []) {
                 for (const w of node.widgets_values || []) {
                     if (typeof w === "string" && MODEL_EXT.test(w)) add(w, undefined, node.type);
                     else if (w && typeof w === "object" && !Array.isArray(w)) {
@@ -176,6 +200,70 @@ function extractModels(variant) {
 
 const normName = s => String(s).trim().replace(/\\/g, "/").toLowerCase();
 const noExt = s => normName(s).split("/").pop().replace(MODEL_EXT, "");
+const QUANT_TOKENS = new Set([
+    "fp4", "fp8", "fp16", "fp32", "bf16", "f16", "f32", "nf4", "nvfp4", "mxfp4", "int4", "int8", "fn", "fnuz",
+    "scaled", "convrot", "gptq", "awq", "svdq", "svdquant", "nunchaku", "gguf"
+]);
+
+/**
+ * File name reduced to its identity: no folder, extension, or quantization/precision tokens
+ * (Q4_K_M, IQ4_XS, fp8_e4m3fn, bf16, int8, convrot, ...). Variants like "turbo" are kept.
+ */
+function quantKey(name) {
+    const tokens = normName(name).split("/").pop().replace(MODEL_EXT, "").split(/[-_. ]+/).filter(Boolean);
+    const kept = [];
+    let afterQ = false;
+    for (const t of tokens) {
+        if (/^i?q\d+$/.test(t)) { afterQ = true; continue; }
+        if (afterQ && /^(?:k|m|s|l|xs|xxs|\d)$/.test(t)) continue; // the K_M / _0 part of Q4_K_M, Q8_0
+        afterQ = false;
+        if (QUANT_TOKENS.has(t) || /^e\dm\d(?:fnuz|fn)?$/.test(t) || /^w\d+a\d+$/.test(t)) continue;
+        kept.push(t);
+    }
+    return kept.join("_");
+}
+
+/** Files sharing most name tokens with `name` (extra or missing words like "attn", "KJ", "turbo"); suggestions only. */
+function relatedModels(name, available) {
+    const tokens = n => new Set(quantKey(n).split("_").filter(Boolean));
+    const want = tokens(name);
+    return available.map(o => {
+        const have = tokens(o);
+        const shared = [...want].filter(t => have.has(t));
+        return { o, words: shared.filter(t => !/^\d+$/.test(t)).length, score: shared.length / Math.max(want.size, have.size, 1) };
+    })
+        .filter(x => x.words >= 2 && x.score >= 0.7)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 3)
+        .map(x => x.o);
+}
+
+/**
+ * How a wanted model file relates to the files a server offers: ok (exact, or same file name in
+ * another folder, with `matches` set), similar (other quantization), or missing.
+ */
+function matchModel(name, available) {
+    const want = normName(name);
+    if (available.some(o => normName(o) === want)) return { st: "ok" };
+    const folder = want.split("/").slice(0, -1).join("/");
+    const closest = list => list.sort((x, y) =>
+        (normName(y).startsWith(folder + "/") ? 1 : 0) - (normName(x).startsWith(folder + "/") ? 1 : 0));
+    // .sft is the short extension for the same safetensors format
+    const canon = o => normName(o).replace(/\.sft$/, ".safetensors");
+    const wantCanon = canon(name);
+    const base = wantCanon.split("/").pop();
+    const moved = available.filter(o => canon(o).split("/").pop() === base);
+    if (moved.length) {
+        const sameFolder = moved.some(o => canon(o) === wantCanon);
+        return { st: "ok", matches: closest(moved), hint: sameFolder ? "found with another extension: " : "found in another folder: " };
+    }
+    const key = quantKey(name);
+    const similar = key.length >= 3 ? available.filter(o => quantKey(o) === key) : [];
+    if (similar.length) return { st: "similar", matches: closest(similar), hint: "similar (other quantization): " };
+    const related = relatedModels(name, available);
+    return related.length ? { st: "related", matches: related, hint: "possibly related: " } : { st: "missing" };
+}
+
 const searchLinks = name => [
     ["Civitai", `https://civitai.com/search/models?query=${encodeURIComponent(noExt(name))}`, "civitai.com"],
     ["Hugging Face", `https://huggingface.co/models?search=${encodeURIComponent(noExt(name))}`, "huggingface.co"],
@@ -207,7 +295,7 @@ function scanText(text) {
         starts.lastIndex = end + 1;
         const chunk = text.slice(m.index, end + 1);
         let obj;
-        try { obj = JSON.parse(chunk); } catch { continue; }
+        try { obj = parseJson(chunk); } catch { continue; }
         if (Array.isArray(obj.nodes)) { if (!workflows.includes(chunk)) workflows.push(chunk); }
         else if (Object.values(obj).some(v => v && typeof v === "object" && "class_type" in v)) { if (!prompts.includes(chunk)) prompts.push(chunk); }
     }
@@ -284,6 +372,7 @@ module.exports = class ComfyUIWorkflow {
         this.observer = null;
         this.scanTimer = null;
         this.iconCache = null;
+        this.positioned = new Set(); // hosts whose position style we set
     }
 
     start() {
@@ -303,6 +392,8 @@ module.exports = class ComfyUIWorkflow {
         this.scanTimer = null;
         BdApi.DOM.removeStyle(this.meta.name);
         document.querySelectorAll(`.${BADGE_CLASS}`).forEach(b => b.remove());
+        this.positioned.forEach(h => { h.style.position = ""; });
+        this.positioned.clear();
         document.querySelectorAll(`[${MARKED_ATTR}]`).forEach(e => e.removeAttribute(MARKED_ATTR));
         this.cache.clear();
     }
@@ -349,7 +440,11 @@ module.exports = class ComfyUIWorkflow {
 
     addBadge(host, url, data, isCode = false) {
         if (!host || host.querySelector(`:scope > .${BADGE_CLASS}`)) return;
-        if (getComputedStyle(host).position === "static") host.style.position = "relative";
+        if (!this.observer) return; // plugin was stopped while the file was being checked
+        if (getComputedStyle(host).position === "static") {
+            host.style.position = "relative";
+            this.positioned.add(host);
+        }
 
         const hasWorkflow = data.variants.some(v => v.workflow);
         const badge = document.createElement("div");
@@ -376,6 +471,10 @@ module.exports = class ComfyUIWorkflow {
 
     get server() {
         return (BdApi.Data.load(this.meta.name, "server") || DEFAULT_SERVER).trim().replace(/\/+$/, "");
+    }
+
+    get copyPathOnSave() {
+        return !!BdApi.Data.load(this.meta.name, "copyPathOnSave");
     }
 
     async chooseFolder(onDone) {
@@ -420,6 +519,7 @@ module.exports = class ComfyUIWorkflow {
         const Panel = () => {
             const [folder, setFolder] = React.useState(plugin.folder);
             const [server, setServer] = React.useState(plugin.server);
+            const [copyPath, setCopyPath] = React.useState(plugin.copyPathOnSave);
             const update = v => { setServer(v); BdApi.Data.save(plugin.meta.name, "server", v.trim()); };
             const inputRef = el => {
                 // Discord swallows key events in plugin settings; keep them on the input.
@@ -430,6 +530,12 @@ module.exports = class ComfyUIWorkflow {
             return h("div", { style: { display: "flex", flexDirection: "column", gap: 12, color: "var(--header-primary)" } },
                 h("div", null, "Save folder: " + folder),
                 h("div", null, btn("Choose folder...", () => plugin.chooseFolder(setFolder))),
+                h("label", { style: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer" } },
+                    h("input", {
+                        type: "checkbox", checked: copyPath,
+                        onChange: e => { setCopyPath(e.target.checked); BdApi.Data.save(plugin.meta.name, "copyPathOnSave", e.target.checked); }
+                    }),
+                    "Copy the file path to the clipboard after saving"),
                 h("div", { style: { marginTop: 8 } }, "ComfyUI server URL (used by \"Send to ComfyUI\" and the model check):"),
                 h("input", {
                     ref: inputRef, type: "text", value: server, spellCheck: false,
@@ -454,13 +560,12 @@ module.exports = class ComfyUIWorkflow {
             const file = multi ? `${base}_${i + 1}` : base;
             const { positive, negative } = extractPrompts(variant);
             if (positive || negative) items.push({ label: `Prompts${tag}`, action: () => this.showPrompts({ positive, negative }, file) });
-            if (variant.prompt) items.push({ label: `Send to ComfyUI${tag}`, action: () => this.sendToComfy(variant.prompt) });
+            if (variant.prompt) items.push({ label: `Queue in ComfyUI${tag}`, action: () => this.sendToComfy(variant.prompt) });
             if (extractModels(variant).length) items.push({ label: `Models and LoRAs${tag}`, action: () => this.showModels(variant, file) });
             if (variant.workflow) items.push({ label: `Save workflow as JSON${tag}`, action: () => this.save(file, variant.workflow) });
             if (variant.prompt) items.push({ label: `Save prompt as JSON${tag}`, action: () => this.save(file + ".prompt", variant.prompt) });
         });
         items.push(
-            { label: "Change save folder...", action: () => this.chooseFolder() },
             {
                 label: "Open save folder",
                 action: () => {
@@ -503,7 +608,8 @@ module.exports = class ComfyUIWorkflow {
             let file = path.join(dir, safe + ".json");
             for (let i = 1; fs.existsSync(file); i++) file = path.join(dir, `${safe} (${i}).json`);
             fs.writeFileSync(file, json, "utf8");
-            BdApi.UI.showToast(`Saved: ${path.basename(file)}`, { type: "success" });
+            if (this.copyPathOnSave) DiscordNative.clipboard.copy(file);
+            BdApi.UI.showToast(`Saved: ${path.basename(file)}` + (this.copyPathOnSave ? " (path copied)" : ""), { type: "success" });
         } catch (err) {
             BdApi.UI.showToast("Save failed: " + err.message, { type: "error" });
         }
@@ -511,32 +617,90 @@ module.exports = class ComfyUIWorkflow {
 
     /* ----------------------------------- ComfyUI ----------------------------------- */
 
+    /**
+     * Compare every model file in the prompt with what the server offers. Same file in another
+     * folder or another quantization is rewritten to the server's name; the rest is reported missing.
+     */
+    async planModels(graph) {
+        const changes = [];
+        const missing = [];
+        const classes = [...new Set(Object.values(graph).map(n => n?.class_type).filter(Boolean))];
+        const options = new Map();
+        await Promise.all(classes.map(async c => options.set(c, await this.comboOptions(c))));
+        for (const [id, node] of Object.entries(graph)) {
+            const combos = options.get(node?.class_type);
+            if (!combos) continue;
+            for (const [key, val] of Object.entries(node.inputs || {})) {
+                if (typeof val !== "string" || !MODEL_EXT.test(val) || !combos[key]) continue;
+                const r = matchModel(val, combos[key]);
+                if (r.st === "ok" && !r.matches) continue;
+                if (r.st === "missing" || r.st === "related") missing.push({ cls: node.class_type, key, name: val });
+                else changes.push({ id, cls: node.class_type, key, from: val, to: r.matches[0], st: r.st });
+            }
+        }
+        return { changes, missing };
+    }
+
     async sendToComfy(promptJson) {
+        let graph;
+        try { graph = parseJson(promptJson); } catch {
+            BdApi.UI.showToast("The prompt JSON is not valid", { type: "error" });
+            return;
+        }
+        const { changes, missing } = await this.planModels(graph);
+        if (missing.length) {
+            this.showLines("Not sent: models missing on the ComfyUI server",
+                missing.map(m => `${m.cls} (${m.key}): ${m.name}`));
+            return;
+        }
+        for (const c of changes) graph[c.id].inputs[c.key] = c.to;
+        const similar = changes.filter(c => c.st === "similar");
+        if (!similar.length) return this.postPrompt(graph, changes.length);
+
+        const h = BdApi.React.createElement;
+        BdApi.UI.showConfirmationModal("Use similar models?", h("div", { className: "cuw-card" },
+            h("div", { className: "cuw-note" }, "These files are not on the server. Send with the similar ones instead?"),
+            similar.map(c => h("div", { key: c.id + c.key, className: "cuw-row" },
+                h("span", { className: "cuw-name" }, c.from, h("div", { className: "cuw-extra" }, "→ " + c.to))))
+        ), { confirmText: "Send", cancelText: "Cancel", onConfirm: () => this.postPrompt(graph, changes.length) });
+    }
+
+    async postPrompt(graph, adjusted) {
         const server = this.server;
         try {
             const res = await BdApi.Net.fetch(`${server}/prompt`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ prompt: JSON.parse(promptJson), client_id: "discord-comfyui-workflow" })
+                body: JSON.stringify({ prompt: graph, client_id: "discord-comfyui-workflow" })
             });
             const text = await res.text();
             if (res.ok) {
                 let n = "";
                 try { n = ` (queue #${JSON.parse(text).number})`; } catch { /* no number */ }
-                BdApi.UI.showToast("Queued in ComfyUI" + n, { type: "success" });
+                BdApi.UI.showToast("Queued in ComfyUI" + n + (adjusted ? `, ${adjusted} model name(s) adjusted` : ""), { type: "success" });
                 return;
             }
-            let msg = `HTTP ${res.status}`;
+            let title = `ComfyUI rejected the prompt (HTTP ${res.status})`;
+            const lines = [];
             try {
                 const err = JSON.parse(text);
-                msg = err.error?.message || msg;
-                const bad = Object.values(err.node_errors || {}).map(n => n.class_type).filter(Boolean);
-                if (bad.length) msg += `: ${[...new Set(bad)].join(", ")}`;
-            } catch { /* keep HTTP status */ }
-            BdApi.UI.showToast("ComfyUI rejected the prompt: " + msg, { type: "error", timeout: 8000 });
+                if (err.error?.message) lines.push(err.error.message + (err.error.details ? `: ${err.error.details}` : ""));
+                for (const [id, ne] of Object.entries(err.node_errors || {})) {
+                    const detail = (ne.errors || []).map(e => [e.message, e.details].filter(Boolean).join(" ")).join("; ");
+                    lines.push(`${ne.class_type} (#${id}): ${detail}`);
+                }
+            } catch { lines.push(text.slice(0, 500)); }
+            this.showLines(title, lines);
         } catch (err) {
             BdApi.UI.showToast(`Cannot reach ComfyUI at ${server} (${err.message}). Set the URL in plugin settings.`, { type: "error", timeout: 8000 });
         }
+    }
+
+    showLines(title, lines) {
+        const h = BdApi.React.createElement;
+        BdApi.UI.showConfirmationModal(title, h("div", { className: "cuw-card" },
+            lines.map((l, i) => h("div", { key: i, className: "cuw-row" }, h("span", { className: "cuw-name" }, l)))
+        ), { confirmText: "Close", cancelText: null });
     }
 
     /** Option lists of every combo input of a node class on the server, or null if unreachable. */
@@ -583,11 +747,11 @@ module.exports = class ComfyUIWorkflow {
         await Promise.all(classes.map(async c => options.set(c, await this.comboOptions(c))));
         const status = m => {
             const combos = options.get(m.cls);
-            if (!combos) return "unknown";
+            if (!combos) return { st: "unknown" };
             const lists = m.key && combos[m.key] ? [combos[m.key]] : Object.values(combos);
-            const want = normName(m.name);
-            return lists.some(l => l.some(o => normName(o) === want)) ? "ok" : "missing";
+            return matchModel(m.name, lists.flat());
         };
+        const symbols = { ok: "✓", similar: "≈", related: "~", missing: "✗", unknown: "?" };
         const reachable = [...options.values()].some(Boolean);
         const icons = await this.loadIcons();
 
@@ -599,10 +763,11 @@ module.exports = class ComfyUIWorkflow {
             kinds.map(kind => h("div", { key: kind },
                 h("h4", null, kind),
                 models.filter(m => m.kind === kind).map(m => {
-                    const st = status(m);
+                    const { st, matches, hint } = status(m);
                     return h("div", { className: "cuw-row", key: m.name + m.cls },
-                        h("span", { className: `cuw-${st}`, title: st }, st === "ok" ? "✓" : st === "missing" ? "✗" : "?"),
-                        h("span", { className: "cuw-name" }, m.name),
+                        h("span", { className: `cuw-${st}`, title: st }, symbols[st]),
+                        h("span", { className: "cuw-name" }, m.name,
+                            matches && h("div", { className: "cuw-extra" }, hint + matches.slice(0, 3).join(", ") + (matches.length > 3 ? ` (+${matches.length - 3})` : ""))),
                         m.strength !== undefined && h("span", { className: "cuw-extra" }, `strength ${m.strength}`),
                         h("span", { className: "cuw-links" },
                             searchLinks(m.name).map(([label, href, domain]) => h("a", { key: label, href, title: `Search ${label}`, target: "_blank", rel: "noreferrer" },
